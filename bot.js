@@ -43,6 +43,8 @@ const MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
 const HISTORY_LIMIT = 10; // 컨텍스트로 가져올 최근 메시지 수
 const MAX_DISCORD_LEN = 2000; // 디스코드 메시지 최대 길이
 const MAX_BOT_CHAIN = 2; // 봇->봇 연속 호출 최대 허용 횟수 (무한루프 방지)
+const MAX_TOOL_ITERATIONS = 5; // 한 응답 안에서 웹사이트 조회를 반복할 수 있는 최대 횟수
+const MAX_PAGE_TEXT_LEN = 6000; // 웹페이지에서 가져올 텍스트 최대 길이
 
 const teamBots = personas.teamBots || {};
 const teamBotIds = new Set(
@@ -67,9 +69,101 @@ const systemPromptWithTeam = `${persona.systemPrompt}
 [팀 멤버에게 작업 위임 시]
 다른 에이전트에게 작업을 배정하거나 의견을 요청할 때는 아래 멘션 형식을 "그대로" 메시지에 포함하세요.
 이 형식을 써야 해당 에이전트가 실제로 알림을 받고 응답합니다 (이름만 글자로 쓰면 동작하지 않습니다).
-${teamMentionInfo}`;
+${teamMentionInfo}
+
+[웹사이트 조회]
+browse_website 도구를 사용하면 특정 웹페이지의 내용을 직접 확인할 수 있습니다.
+- 우리 회사 쇼핑몰: https://dodoskin.com
+- 경쟁사 사이트나, 우리가 상품을 소싱하는 브랜드/도매몰 사이트도 URL을 알면 같은 도구로 확인할 수 있습니다.
+- 사용자가 "우리 사이트", "경쟁사", "도매몰/브랜드몰" 등을 확인해달라고 하면, 적절한 URL로 이 도구를 호출해 실제 내용을 바탕으로 답변하세요.
+- 페이지 내용이 길면 일부만 보일 수 있으니, 필요하면 다른 하위 페이지 URL로 다시 조회하세요.`;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// Claude가 사용할 수 있는 도구 목록
+const tools = [
+  {
+    name: "browse_website",
+    description:
+      "지정한 URL의 웹페이지를 가져와 텍스트 내용을 반환합니다. 우리 쇼핑몰(dodoskin.com), 경쟁사 사이트, 상품을 소싱하는 브랜드/도매몰 등 특정 웹사이트의 실제 내용을 확인할 때 사용하세요.",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "확인할 웹페이지의 전체 URL (예: https://dodoskin.com 또는 https://dodoskin.com/products/...)",
+        },
+      },
+      required: ["url"],
+    },
+  },
+];
+
+// 간단한 HTML -> 텍스트 변환 (스크립트/스타일 제거, 태그 제거, 공백 정리)
+function htmlToText(html) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\s*\n\s*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// 웹페이지를 가져와 텍스트로 반환 (실패 시 에러 메시지 문자열 반환)
+async function browseWebsite(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return `오류: 지원하지 않는 URL 형식입니다 (${url})`;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    let res;
+    try {
+      res = await fetch(parsed.toString(), {
+        signal: controller.signal,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (compatible; TeamAgentBot/1.0; +https://dodoskin.com)",
+        },
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!res.ok) {
+      return `오류: ${url} 요청 실패 (HTTP ${res.status})`;
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    const body = await res.text();
+
+    let text;
+    if (contentType.includes("html")) {
+      text = htmlToText(body);
+    } else {
+      text = body;
+    }
+
+    if (text.length > MAX_PAGE_TEXT_LEN) {
+      text = text.slice(0, MAX_PAGE_TEXT_LEN) + "\n... (내용이 길어 일부만 표시됨)";
+    }
+
+    return `[${url} 의 내용]\n${text || "(내용 없음)"}`;
+  } catch (err) {
+    return `오류: ${url} 을 가져오는 중 문제가 발생했습니다 (${err.message})`;
+  }
+}
 
 const client = new Client({
   intents: [
@@ -181,12 +275,48 @@ client.on("messageCreate", async (message) => {
 
     const messages = [...history, { role: "user", content: `${message.author.username}: ${prompt}` }];
 
-    const response = await anthropic.messages.create({
+    let response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 1500,
       system: systemPromptWithTeam,
+      tools,
       messages,
     });
+
+    // Claude가 웹사이트 조회(browse_website)를 요청하면 실행하고 결과를 다시 전달
+    let iterations = 0;
+    while (response.stop_reason === "tool_use" && iterations < MAX_TOOL_ITERATIONS) {
+      iterations++;
+      const toolUseBlocks = response.content.filter((b) => b.type === "tool_use");
+
+      messages.push({ role: "assistant", content: response.content });
+
+      const toolResults = [];
+      for (const block of toolUseBlocks) {
+        let resultText;
+        if (block.name === "browse_website") {
+          await message.channel.sendTyping();
+          resultText = await browseWebsite(block.input && block.input.url);
+        } else {
+          resultText = `알 수 없는 도구입니다: ${block.name}`;
+        }
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: resultText,
+        });
+      }
+
+      messages.push({ role: "user", content: toolResults });
+
+      response = await anthropic.messages.create({
+        model: MODEL,
+        max_tokens: 1500,
+        system: systemPromptWithTeam,
+        tools,
+        messages,
+      });
+    }
 
     const text = response.content
       .filter((b) => b.type === "text")
