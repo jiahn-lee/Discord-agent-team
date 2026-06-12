@@ -1,0 +1,16 @@
+# 이 파일을 .env 로 복사한 뒤 값을 채워주세요.
+# 클라우드(Railway 등)에 배포할 때는 .env 파일 대신
+# 서비스의 환경변수(Environment Variables) 설정에 동일한 값들을 입력합니다.
+
+# 이 봇 전용 디스코드 토큰 (Discord Developer Portal > Bot > Token)
+DISCORD_TOKEN=
+
+# 모든 봇이 공통으로 사용하는 Anthropic API 키 (console.anthropic.com)
+ANTHROPIC_API_KEY=
+
+# 이 봇의 역할 (personas.js 참고)
+# pm | developer | performance_marketing | seo_content | product_detail | design
+BOT_ROLE=pm
+
+# (선택) 사용할 Claude 모델. 기본값: claude-sonnet-4-6
+CLAUDE_MODEL=claude-sonnet-4-6
