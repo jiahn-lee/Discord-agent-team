@@ -42,6 +42,32 @@ if (!process.env.ANTHROPIC_API_KEY) {
 const MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
 const HISTORY_LIMIT = 10; // 컨텍스트로 가져올 최근 메시지 수
 const MAX_DISCORD_LEN = 2000; // 디스코드 메시지 최대 길이
+const MAX_BOT_CHAIN = 2; // 봇->봇 연속 호출 최대 허용 횟수 (무한루프 방지)
+
+const teamBots = personas.teamBots || {};
+const teamBotIds = new Set(
+  Object.values(teamBots)
+    .map((b) => b && b.id)
+    .filter(Boolean)
+);
+
+// 다른 팀 에이전트에게 작업을 위임할 때 쓸 실제 멘션 안내를 system prompt에 추가
+const teamMentionInfo = Object.entries(teamBots)
+  .filter(([role]) => role !== ROLE)
+  .map(([role, info]) => {
+    const name = (personas[role] && personas[role].displayName) || role;
+    return info && info.id
+      ? `- ${name} (${role}): <@${info.id}>`
+      : `- ${name} (${role}): 아직 멘션 ID 미등록 (봇 생성 후 personas.js에 추가 필요)`;
+  })
+  .join("\n");
+
+const systemPromptWithTeam = `${persona.systemPrompt}
+
+[팀 멤버에게 작업 위임 시]
+다른 에이전트에게 작업을 배정하거나 의견을 요청할 때는 아래 멘션 형식을 "그대로" 메시지에 포함하세요.
+이 형식을 써야 해당 에이전트가 실제로 알림을 받고 응답합니다 (이름만 글자로 쓰면 동작하지 않습니다).
+${teamMentionInfo}`;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -62,13 +88,15 @@ client.once("ready", () => {
   });
 });
 
-// 긴 응답을 디스코드 메시지 길이 제한에 맞춰 분할 전송
-async function sendLongMessage(channel, text) {
+// 긴 응답을 디스코드 메시지 길이 제한에 맞춰 분할 전송 (첫 조각은 답장 형태로)
+async function sendLongMessage(message, text) {
+  const channel = message.channel;
   if (text.length <= MAX_DISCORD_LEN) {
-    await channel.send(text);
+    await message.reply(text);
     return;
   }
   let remaining = text;
+  let first = true;
   while (remaining.length > 0) {
     let chunk = remaining.slice(0, MAX_DISCORD_LEN);
     // 가능하면 줄바꿈 단위로 자르기
@@ -76,15 +104,48 @@ async function sendLongMessage(channel, text) {
     if (lastNewline > 500 && remaining.length > MAX_DISCORD_LEN) {
       chunk = chunk.slice(0, lastNewline);
     }
-    await channel.send(chunk);
+    if (first) {
+      await message.reply(chunk);
+      first = false;
+    } else {
+      await channel.send(chunk);
+    }
     remaining = remaining.slice(chunk.length);
   }
 }
 
+// 봇->봇 연속 호출 깊이 계산 (답장 체인을 따라 올라가며 봇 작성 메시지 개수 카운트)
+async function getBotChainDepth(message, maxDepth) {
+  let depth = message.author.bot ? 1 : 0;
+  let current = message;
+  while (depth < maxDepth && current.reference && current.reference.messageId) {
+    try {
+      current = await current.channel.messages.fetch(current.reference.messageId);
+    } catch (_) {
+      break;
+    }
+    if (current.author.bot) {
+      depth++;
+    } else {
+      break;
+    }
+  }
+  return depth;
+}
+
 client.on("messageCreate", async (message) => {
   try {
-    // 자기 자신이나 다른 봇의 메시지는 무시 (봇끼리 무한 루프 방지)
-    if (message.author.bot) return;
+    // 자기 자신의 메시지는 항상 무시
+    if (message.author.id === client.user.id) return;
+
+    if (message.author.bot) {
+      // 우리 팀 봇이 아닌 외부 봇/웹훅 메시지는 무시
+      if (!teamBotIds.has(message.author.id)) return;
+
+      // 봇->봇 연속 호출이 너무 길어지면 무한루프 방지를 위해 중단
+      const chainDepth = await getBotChainDepth(message, MAX_BOT_CHAIN + 1);
+      if (chainDepth > MAX_BOT_CHAIN) return;
+    }
 
     // 이 봇이 멘션되었는지 확인
     if (!message.mentions.has(client.user.id)) return;
@@ -123,7 +184,7 @@ client.on("messageCreate", async (message) => {
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 1500,
-      system: persona.systemPrompt,
+      system: systemPromptWithTeam,
       messages,
     });
 
@@ -133,7 +194,7 @@ client.on("messageCreate", async (message) => {
       .join("\n")
       .trim();
 
-    await sendLongMessage(message.channel, text || "(빈 응답)");
+    await sendLongMessage(message, text || "(빈 응답)");
   } catch (err) {
     console.error(`[${persona.displayName}] 오류:`, err);
     try {
