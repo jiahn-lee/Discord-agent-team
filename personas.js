@@ -81,3 +81,17 @@ module.exports = {
 말투: 시각적 디테일을 구체적으로 묘사하는 한국어. 실행 가능한 가이드 형태로 정리.`,
   },
 };
+
+// 팀 멤버 봇들의 디스코드 "Application ID(=봇 사용자 ID)" 목록입니다.
+// 각 봇의 Discord Developer Portal > General Information 첫 화면에서 확인할 수 있습니다.
+// 이 값이 있어야 다른 에이전트가 실제로 멘션(알림)을 받고 응답할 수 있습니다.
+// 아직 만들지 않은 봇은 id를 null로 두세요. 봇을 새로 만들면 여기에 ID를 채우고
+// 6개 서비스 모두 다시 배포(redeploy)해야 합니다.
+module.exports.teamBots = {
+  pm: { id: "1515075153594421258" },
+  developer: { id: "1515087194870517883" },
+  performance_marketing: { id: null },
+  seo_content: { id: null },
+  product_detail: { id: null },
+  design: { id: "1515093257111998616" },
+};
